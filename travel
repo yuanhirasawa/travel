@@ -1,0 +1,631 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+// 導入 Firebase 模組
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, onSnapshot, setDoc } from 'firebase/firestore';
+
+// =========================================================================
+// 應用程式配置
+// =========================================================================
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'travel-planner-v2';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+const DEFAULT_RATE = 0.21;
+const ACCENT_COLOR = '#FF7E00'; // 品牌橘色
+
+// 初始多旅程容器結構
+const initialAppState = {
+    trips: [], 
+};
+
+// 建立新旅程的範本
+const createNewTripTemplate = (title) => ({
+    id: Date.now().toString(),
+    title: title || "未命名旅程",
+    createdAt: Date.now(),
+    itineraries: [
+        { id: '1', date: new Date().toISOString().split('T')[0], events: [] },
+    ],
+    ledger: [],
+    checklist: [
+        { id: 'c1', item: '護照', checked: false },
+    ],
+    documents: [], 
+    shoppingList: [], 
+    memo: '這是一份新的備忘錄，可以在此輸入重要提醒...', 
+});
+
+// =========================================================================
+// 簡約風格基礎元件
+// =========================================================================
+
+const GlassCard = ({ children, className = '', onClick }) => (
+    <div
+        className={`bg-white border border-slate-200 rounded-2xl shadow-sm hover:shadow-md transition-all duration-300 ${className}`}
+        onClick={onClick}
+    >
+        {children}
+    </div>
+);
+
+const PrimaryButton = ({ children, className = '', onClick, disabled = false, style = {} }) => (
+    <button
+        disabled={disabled}
+        className={`bg-orange-500 text-white font-bold py-3 px-6 rounded-xl shadow-orange-100 shadow-lg hover:bg-orange-600 active:scale-95 transition-all duration-200 disabled:opacity-50 disabled:scale-100 ${className}`}
+        onClick={onClick}
+        style={{ backgroundColor: ACCENT_COLOR, ...style }}
+    >
+        {children}
+    </button>
+);
+
+const GhostButton = ({ children, className = '', onClick, style = {} }) => (
+    <button
+        className={`bg-slate-100 text-slate-600 font-bold py-2 px-4 rounded-lg hover:bg-slate-200 transition-all ${className}`}
+        onClick={onClick}
+        style={style}
+    >
+        {children}
+    </button>
+);
+
+const StyledInput = (props) => (
+    <input className="w-full p-3 border-2 border-slate-200 rounded-xl font-bold focus:outline-none focus:ring-2 focus:ring-orange-500 bg-slate-50 text-slate-800 placeholder-slate-400" {...props} />
+);
+
+const CustomToast = ({ message, type, visible }) => {
+    if (!visible || !message) return null;
+    const isSuccess = type === 'success';
+    const content = typeof message === 'string' ? message : JSON.stringify(message);
+    return (
+        <div className={`fixed top-6 left-1/2 -translate-x-1/2 z-[200] px-6 py-3 rounded-full font-bold shadow-2xl transition-all animate-bounce ${isSuccess ? 'bg-emerald-500 text-white' : 'bg-slate-800 text-white'}`}>
+            {content}
+        </div>
+    );
+};
+
+// =========================================================================
+// 模態框元件
+// =========================================================================
+
+const ModalWrapper = ({ isOpen, onClose, title, children }) => {
+    if (!isOpen) return null;
+    return (
+        <div className="fixed inset-0 bg-slate-900/40 z-[150] flex items-center justify-center p-4 backdrop-blur-sm" onClick={onClose}>
+            <div className="bg-white w-full max-w-lg rounded-3xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200" onClick={e => e.stopPropagation()}>
+                <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center">
+                    <h2 className="text-xl font-bold text-slate-800">{title}</h2>
+                    <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><i className="fas fa-times text-lg"></i></button>
+                </div>
+                <div className="p-6 overflow-y-auto max-h-[80vh]">{children}</div>
+            </div>
+        </div>
+    );
+};
+
+const AddTripModal = ({ isOpen, onClose, onAdd }) => {
+    const [title, setTitle] = useState('');
+    if (!isOpen) return null;
+    return (
+        <ModalWrapper isOpen={isOpen} onClose={onClose} title="建立新旅程計畫">
+            <div className="space-y-4">
+                <StyledInput value={title} onChange={e => setTitle(e.target.value)} placeholder="例如：日本東京跨年之旅" autoFocus />
+                <div className="flex space-x-2">
+                    <button onClick={onClose} className="flex-1 p-3 border border-slate-200 rounded-xl font-bold bg-slate-50 text-slate-600">取消</button>
+                    <PrimaryButton onClick={() => { onAdd(title); setTitle(''); }} className="flex-1">建立旅程</PrimaryButton>
+                </div>
+            </div>
+        </ModalWrapper>
+    );
+};
+
+const ConfirmModal = ({ isOpen, onClose, message, onConfirm }) => {
+    if (!isOpen) return null;
+    return (
+        <ModalWrapper isOpen={isOpen} onClose={onClose} title="確認操作">
+            <div className="space-y-6 text-center">
+                <p className="font-bold text-slate-700 text-lg">{message}</p>
+                <div className="flex space-x-3">
+                    <button onClick={onClose} className="flex-1 py-3 border border-slate-200 rounded-xl font-bold bg-slate-50 text-slate-600">取消</button>
+                    <button onClick={() => { onConfirm(); onClose(); }} className="flex-1 py-3 bg-red-500 text-white font-bold rounded-xl shadow-lg hover:bg-red-600">確定刪除</button>
+                </div>
+            </div>
+        </ModalWrapper>
+    );
+};
+
+// =========================================================================
+// 新增表單內容組件
+// =========================================================================
+
+const AddFormContent = ({ view, showToast, activeTrip, onUpdate, onClose }) => {
+    const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+    const [time, setTime] = useState('12:00');
+    const [activity, setActivity] = useState('');
+    const [expenseDesc, setExpenseDesc] = useState('');
+    const [expenseAmt, setExpenseAmt] = useState('');
+    const [expenseRate, setExpenseRate] = useState(0.21);
+    const [docTitle, setDocTitle] = useState('');
+    const [docContent, setDocContent] = useState(''); 
+    
+    const [shopName, setShopName] = useState('');
+    const [itemPrice, setItemPrice] = useState('');
+    const [itemImg, setItemImg] = useState('');
+
+    const save = (updatedTrip) => { onUpdate(updatedTrip); onClose(); };
+
+    const handleFileUpload = (e, targetSetter) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (upload) => { targetSetter(upload.target.result); };
+        reader.readAsDataURL(file);
+    };
+
+    if (view === 'itinerary') return (
+        <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+                <div><label className="text-xs font-bold text-slate-400 mb-1 block">日期</label><StyledInput type="date" value={date} onChange={e => setDate(e.target.value)} /></div>
+                <div><label className="text-xs font-bold text-slate-400 mb-1 block">時間</label><StyledInput type="time" value={time} onChange={e => setTime(e.target.value)} /></div>
+            </div>
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">活動內容</label><StyledInput value={activity} onChange={e => setActivity(e.target.value)} placeholder="例如：抵達飯店、晚餐..." /></div>
+            <PrimaryButton onClick={() => {
+                const newItins = [...(activeTrip.itineraries || [])];
+                const idx = newItins.findIndex(i => i.date === date);
+                if (idx > -1) newItins[idx].events = [...(newItins[idx].events || []), {time, activity}];
+                else newItins.push({id: Date.now().toString(), date, events:[{time, activity}]});
+                save({...activeTrip, itineraries: newItins});
+                showToast('行程已新增');
+            }} className="w-full">儲存行程</PrimaryButton>
+        </div>
+    );
+
+    if (view === 'accounting') return (
+        <div className="space-y-4">
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">消費日期</label><StyledInput type="date" value={date} onChange={e => setDate(e.target.value)} /></div>
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">支出描述</label><StyledInput value={expenseDesc} onChange={e => setExpenseDesc(e.target.value)} placeholder="例如：地鐵票、藥妝..." /></div>
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">金額 (日幣 ¥)</label><StyledInput type="number" value={expenseAmt} onChange={e => setExpenseAmt(e.target.value)} placeholder="0" /></div>
+            <PrimaryButton onClick={() => {
+                const jpy = parseFloat(expenseAmt);
+                if (isNaN(jpy)) return;
+                save({...activeTrip, ledger: [...(activeTrip.ledger || []), { id: Date.now().toString(), description: expenseDesc, jpy, twd: Math.round(jpy * expenseRate), date, hasTwd: true, rate: expenseRate }]});
+                showToast('花費已紀錄');
+            }} className="w-full">紀錄開銷</PrimaryButton>
+        </div>
+    );
+
+    if (view === 'documents') return (
+        <div className="space-y-4">
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">文件標題</label><StyledInput value={docTitle} onChange={e => setDocTitle(e.target.value)} placeholder="機票、預約番號..." /></div>
+            <div className="border-2 border-dashed border-slate-200 p-8 text-center rounded-2xl bg-slate-50 relative group">
+                <input type="file" onChange={(e) => handleFileUpload(e, setDocContent)} className="absolute inset-0 opacity-0 cursor-pointer" accept="image/*" />
+                <i className="fas fa-camera text-2xl mb-2 text-slate-300"></i>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">點擊上傳截圖</p>
+            </div>
+            <div className="text-center text-xs font-black text-slate-200 uppercase">或是貼上網址</div>
+            <StyledInput value={docContent} onChange={e => setDocContent(e.target.value)} placeholder="貼上 PDF 連結或網址..." />
+            <PrimaryButton onClick={() => {
+                if (!docTitle) return;
+                save({...activeTrip, documents: [...(activeTrip.documents || []), { id: Date.now().toString(), title: docTitle, content: docContent, type: docContent.startsWith('data:') ? 'image' : 'link', date: new Date().toISOString().split('T')[0] }]});
+                showToast('文件已儲存');
+            }} className="w-full">儲存文件</PrimaryButton>
+        </div>
+    );
+
+    if (view === 'shopping') return (
+        <div className="space-y-4">
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">商品名稱</label><StyledInput value={activity} onChange={e => setActivity(e.target.value)} placeholder="想買什麼？" /></div>
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">購買店家</label><StyledInput value={shopName} onChange={e => setShopName(e.target.value)} placeholder="在哪裡買？(如：大國藥妝)" /></div>
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">預估價格</label><StyledInput value={itemPrice} onChange={e => setItemPrice(e.target.value)} placeholder="多少錢？" /></div>
+            <div className="border-2 border-dashed border-slate-200 p-6 text-center rounded-2xl bg-slate-50 relative">
+                <input type="file" onChange={(e) => handleFileUpload(e, setItemImg)} className="absolute inset-0 opacity-0 cursor-pointer" accept="image/*" />
+                <i className="fas fa-shopping-bag text-2xl mb-2 text-slate-300"></i>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">點擊上傳商品圖片</p>
+            </div>
+            {itemImg && <img src={itemImg} className="h-20 w-auto rounded-lg mx-auto border border-slate-100 shadow-sm" alt="Preview" />}
+            <PrimaryButton onClick={() => {
+                if (!activity) return;
+                save({...activeTrip, shoppingList: [...(activeTrip.shoppingList || []), { id: Date.now().toString(), title: activity, shop: shopName, price: itemPrice, image: itemImg, checked: false }]});
+                showToast('已加入購物清單');
+            }} className="w-full">加入清單</PrimaryButton>
+        </div>
+    );
+
+    if (view === 'checklist') return (
+        <div className="space-y-4">
+            <div><label className="text-xs font-bold text-slate-400 mb-1 block">打包項目</label><StyledInput value={activity} onChange={e => setActivity(e.target.value)} placeholder="要準備什麼？" /></div>
+            <PrimaryButton onClick={() => {
+                if (!activity) return;
+                save({...activeTrip, checklist: [...(activeTrip.checklist || []), {id:Date.now().toString(), item:activity, checked:false}]});
+                showToast('已加入打包清單');
+            }} className="w-full">加入清單</PrimaryButton>
+        </div>
+    );
+
+    return null;
+};
+
+// =========================================================================
+// App 主體
+// =========================================================================
+
+const App = () => {
+    const [appState, setAppState] = useState(initialAppState);
+    const [activeTripId, setActiveTripId] = useState(null);
+    const [view, setView] = useState('home');
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    
+    const [toast, setToast] = useState({ message: '', type: 'info', visible: false });
+    const [isAddTripModalOpen, setIsAddTripModalOpen] = useState(false);
+    const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+    const [confirmModalState, setConfirmModalState] = useState({ isOpen: false, message: '', action: () => {} });
+    
+    const [selectedDateTab, setSelectedDateTab] = useState('');
+
+    const activeTrip = useMemo(() => {
+        if (!appState.trips) return null;
+        const trip = appState.trips.find(t => t.id === activeTripId);
+        if (trip && !selectedDateTab && trip.itineraries?.length > 0) {
+            setSelectedDateTab(trip.itineraries[0].date);
+        }
+        return trip || null;
+    }, [appState.trips, activeTripId, selectedDateTab]);
+
+    const showToast = useCallback((message, type = 'success') => {
+        setToast({ message, type, visible: true });
+        setTimeout(() => setToast(prev => ({ ...prev, visible: false })), 3000);
+    }, []);
+
+    // Firebase 初始化
+    useEffect(() => {
+        const app = initializeApp(firebaseConfig);
+        const firestore = getFirestore(app);
+        const auth = getAuth(app);
+        setDb(firestore);
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                if (initialAuthToken) {
+                    try { await signInWithCustomToken(auth, initialAuthToken); } catch(e) { await signInAnonymously(auth); }
+                } else {
+                    await signInAnonymously(auth);
+                }
+            }
+            setIsAuthReady(true);
+        });
+    }, []);
+
+    // 資料同步
+    useEffect(() => {
+        if (!isAuthReady || !db || !userId) return;
+        const dataDocRef = doc(db, 'artifacts', appId, 'users', userId, 'travel_data', 'travel_plan');
+        return onSnapshot(dataDocRef, (snap) => {
+            if (snap.exists()) setAppState(snap.data());
+            else setDoc(dataDocRef, initialAppState);
+        });
+    }, [isAuthReady, db, userId]);
+
+    const updateAppState = useCallback((newState) => {
+        if (!db || !userId) return;
+        setDoc(doc(db, 'artifacts', appId, 'users', userId, 'travel_data', 'travel_plan'), newState);
+    }, [db, userId]);
+
+    const updateActiveTrip = (updatedTrip) => {
+        const newTrips = (appState.trips || []).map(t => t.id === updatedTrip.id ? updatedTrip : t);
+        updateAppState({ ...appState, trips: newTrips });
+    };
+
+    // ------------------------------------
+    // 渲染函式
+    // ------------------------------------
+    
+    const renderTripList = () => (
+        <div className="space-y-8 animate-in fade-in duration-500">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-end gap-4">
+                <div>
+                    <h1 className="text-3xl font-black text-slate-800">我的旅程計畫</h1>
+                    <p className="text-slate-400 font-medium">記錄下每一次的心動瞬間</p>
+                </div>
+                <PrimaryButton onClick={() => setIsAddTripModalOpen(true)} className="w-full sm:w-auto">
+                    <i className="fas fa-plus mr-2"></i>建立新計畫
+                </PrimaryButton>
+            </div>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                {(appState.trips || []).map(trip => (
+                    <GlassCard key={trip.id} className="p-6 cursor-pointer group" onClick={() => { setActiveTripId(trip.id); setView('home'); }}>
+                        <div className="flex justify-between items-start mb-6">
+                            <h2 className="text-2xl font-bold text-slate-800 group-hover:text-orange-500 transition-colors">{trip.title}</h2>
+                            <button onClick={(e) => { e.stopPropagation(); setConfirmModalState({ isOpen: true, message: `確定要刪除「${trip.title}」計畫嗎？`, action: () => updateAppState({ ...appState, trips: (appState.trips || []).filter(t => t.id !== trip.id) }) }); }} className="text-slate-300 hover:text-red-500"><i className="fas fa-trash-alt"></i></button>
+                        </div>
+                        <div className="flex flex-wrap gap-4 text-sm font-semibold text-slate-500">
+                            <span className="flex items-center"><i className="far fa-calendar-alt mr-2 text-orange-400"></i>{(trip.itineraries || []).length} 天</span>
+                            <span className="flex items-center"><i className="fas fa-receipt mr-2 text-blue-400"></i>{(trip.ledger || []).length} 筆支出</span>
+                            <span className="flex items-center"><i className="fas fa-shopping-bag mr-2 text-emerald-400"></i>{(trip.shoppingList?.length || 0)} 件商品</span>
+                        </div>
+                    </GlassCard>
+                ))}
+                {(!appState.trips || appState.trips.length === 0) && (
+                    <div className="col-span-full py-24 text-center bg-slate-50 rounded-3xl border-2 border-dashed border-slate-100">
+                        <i className="fas fa-map-marked-alt text-4xl text-slate-300 mb-4"></i>
+                        <p className="font-bold text-slate-400">目前還沒有計畫，開啟你的第一個旅程吧！</p>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+
+    const renderActiveTripView = () => {
+        if (!activeTrip) return null;
+
+        if (view === 'home') {
+            const todayEvents = activeTrip.itineraries?.find(i => i.date === selectedDateTab)?.events?.slice(0, 3) || [];
+            const totalTwd = (activeTrip.ledger || []).reduce((s, e) => s + (e.twd || 0), 0) || 0;
+            
+            const uncheckedChecklist = (activeTrip.checklist || []).filter(i => !i.checked);
+            const progress = (activeTrip.checklist && activeTrip.checklist.length > 0)
+                ? Math.round((activeTrip.checklist.filter(i=>i.checked).length / activeTrip.checklist.length) * 100)
+                : 0;
+
+            const recentShopping = (activeTrip.shoppingList || []).slice(-2).reverse();
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-in fade-in duration-500 pb-10">
+                    {/* 行程摘要 */}
+                    <GlassCard className="md:col-span-2 p-6" onClick={() => setView('itinerary')}>
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl font-bold text-slate-800">今日行程快報</h2>
+                            <span className="text-sm font-bold text-orange-500">{selectedDateTab}</span>
+                        </div>
+                        <div className="space-y-3">
+                            {todayEvents.length > 0 ? todayEvents.map((e,idx)=>(
+                                <div key={idx} className="flex items-center text-slate-700 font-medium bg-slate-50 p-3 rounded-2xl border border-slate-100">
+                                    <span className="text-orange-500 font-black mr-3">{e.time}</span>
+                                    <span className="flex-1 truncate">{e.activity}</span>
+                                </div>
+                            )) : <p className="text-slate-400 italic">點擊開始規劃行程吧！</p>}
+                        </div>
+                    </GlassCard>
+
+                    {/* 預算統計 */}
+                    <GlassCard className="p-6 bg-slate-900 text-white" onClick={() => setView('accounting')}>
+                        <h2 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">預估總支出</h2>
+                        <div className="text-4xl font-black">${totalTwd.toLocaleString()}</div>
+                        <p className="mt-4 text-xs text-slate-500">點擊查看詳細帳務 $\rightarrow$</p>
+                    </GlassCard>
+
+                    {/* 旅遊備忘錄 */}
+                    <GlassCard className="p-6 bg-orange-50 border-orange-100 flex flex-col h-full min-h-[220px]">
+                        <div className="flex justify-between items-center mb-4 text-orange-800">
+                            <h2 className="text-lg font-bold">旅遊備忘錄</h2>
+                            <i className="fas fa-sticky-note opacity-30"></i>
+                        </div>
+                        <textarea 
+                            className="bg-transparent flex-1 w-full text-sm font-medium text-orange-900 focus:outline-none resize-none leading-relaxed"
+                            value={activeTrip.memo || ''}
+                            placeholder="在這裡記下重要提醒..."
+                            onChange={(e) => updateActiveTrip({ ...activeTrip, memo: e.target.value })}
+                        />
+                    </GlassCard>
+
+                    {/* 打包清單摘要 (新增到主頁) */}
+                    <GlassCard className="p-6 flex flex-col justify-between" onClick={() => setView('checklist')}>
+                        <div>
+                            <h2 className="text-lg font-bold text-slate-800 mb-2">打包清單</h2>
+                            <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden mb-4">
+                                <div className="h-full bg-orange-500" style={{width:`${progress}%`}}></div>
+                            </div>
+                            <div className="space-y-1">
+                                {uncheckedChecklist.slice(0, 3).map((item, idx) => (
+                                    <div key={idx} className="text-xs font-bold text-slate-500 flex items-center">
+                                        <div className="w-1 h-1 bg-slate-300 rounded-full mr-2"></div>
+                                        {item.item}
+                                    </div>
+                                ))}
+                                {uncheckedChecklist.length > 3 && <p className="text-[10px] text-slate-400 font-bold">...還有 {uncheckedChecklist.length - 3} 項待辦</p>}
+                                {uncheckedChecklist.length === 0 && <p className="text-xs text-emerald-500 font-bold">準備齊全了！✨</p>}
+                            </div>
+                        </div>
+                    </GlassCard>
+
+                    {/* 必買清單摘要 (新增到主頁) */}
+                    <GlassCard className="p-6 flex flex-col justify-between" onClick={() => setView('shopping')}>
+                        <div className="h-full flex flex-col">
+                            <h2 className="text-lg font-bold text-slate-800 mb-3">想要購買</h2>
+                            {recentShopping.length > 0 ? (
+                                <div className="space-y-3 flex-1">
+                                    {recentShopping.map((item, idx) => (
+                                        <div key={idx} className="flex items-center text-xs bg-slate-50 p-2 rounded-lg border border-slate-100">
+                                            {item.image && <img src={item.image} className="w-8 h-8 rounded object-cover mr-2" alt="item" />}
+                                            <div className="flex-1 min-w-0">
+                                                <p className="font-bold text-slate-700 truncate">{item.title}</p>
+                                                <p className="text-orange-500 font-black tracking-tighter">{item.price}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <div className="flex-1 flex items-center justify-center border-2 border-dashed border-slate-100 rounded-xl">
+                                    <p className="text-[10px] text-slate-300 font-bold">尚無心願商品</p>
+                                </div>
+                            )}
+                        </div>
+                    </GlassCard>
+
+                    {/* 文件管理 */}
+                    <GlassCard className="md:col-span-3 p-5 flex items-center justify-between" onClick={() => setView('documents')}>
+                        <div className="flex items-center">
+                            <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center mr-4 text-blue-500">
+                                <i className="fas fa-folder-open"></i>
+                            </div>
+                            <div>
+                                <h2 className="text-lg font-bold text-slate-800 tracking-tight">重要文件憑證庫</h2>
+                                <p className="text-xs font-bold text-slate-400 uppercase">Stored {(activeTrip.documents?.length || 0)} Travel Documents</p>
+                            </div>
+                        </div>
+                        <i className="fas fa-chevron-right text-slate-200"></i>
+                    </GlassCard>
+                </div>
+            );
+        }
+
+        if (view === 'itinerary') {
+            const sortedItins = [...(activeTrip.itineraries || [])].sort((a,b) => new Date(a.date) - new Date(b.date));
+            const currentItin = sortedItins.find(i => i.date === selectedDateTab) || sortedItins[0];
+            return (
+                <div className="space-y-8 animate-in fade-in duration-300">
+                    <div className="flex justify-between items-center border-b border-slate-100 pb-4">
+                        <h1 className="text-3xl font-black text-slate-800">行程規劃</h1>
+                        <GhostButton onClick={() => setIsAddModalOpen(true)} className="text-orange-500 px-5 rounded-xl">
+                            <i className="fas fa-plus mr-2"></i>新增行程
+                        </GhostButton>
+                    </div>
+                    <div className="flex space-x-3 overflow-x-auto pb-4 no-scrollbar">
+                        {sortedItins.map(itin => (
+                            <button key={itin.id} onClick={() => setSelectedDateTab(itin.date)} className={`px-6 py-2.5 rounded-2xl font-bold whitespace-nowrap transition-all border ${selectedDateTab === itin.date ? 'bg-orange-500 text-white border-orange-500 shadow-lg shadow-orange-100' : 'bg-white text-slate-400 border-slate-200'}`}>{itin.date.split('-').slice(1).join('/')}</button>
+                        ))}
+                    </div>
+                    <div className="space-y-4">
+                        <h3 className="text-xl font-bold text-slate-800 mb-6 flex items-center"><span className="w-2.5 h-8 bg-orange-500 rounded-full mr-4"></span>{selectedDateTab}</h3>
+                        {(currentItin?.events || []).sort((a,b)=>a.time.localeCompare(b.time)).map((e, idx) => (
+                            <GlassCard key={idx} className="p-5 flex justify-between items-center bg-white">
+                                <div className="flex items-center"><div className="w-14 h-12 bg-slate-50 rounded-2xl flex items-center justify-center font-black text-orange-500 text-sm mr-5 border border-slate-100">{e.time}</div><span className="font-bold text-slate-700 text-lg">{e.activity}</span></div>
+                                <button onClick={() => { const newItins = activeTrip.itineraries.map(i => i.date === selectedDateTab ? {...i, events: i.events.filter(ev=>ev!==e)} : i); updateActiveTrip({...activeTrip, itineraries: newItins}); }} className="text-slate-200 hover:text-red-400 transition-colors"><i className="fas fa-trash-alt"></i></button>
+                            </GlassCard>
+                        ))}
+                        {(!currentItin?.events?.length) && <div className="text-center py-20 bg-slate-50 rounded-3xl border-2 border-dashed border-slate-200 text-slate-400 font-bold">點擊下方按鈕開始安排這天的行程吧！</div>}
+                    </div>
+                </div>
+            );
+        }
+
+        if (view === 'accounting') return (
+            <div className="space-y-8 animate-in fade-in duration-300">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-4"><h1 className="text-3xl font-black text-slate-800">記帳本</h1></div>
+                <div className="space-y-4">
+                    {(activeTrip.ledger || []).slice().reverse().map(e => (
+                        <GlassCard key={e.id} className="p-5 flex justify-between items-center bg-white">
+                            <div><h3 className="font-bold text-slate-800 text-lg">{e.description}</h3><p className="text-xs font-bold text-slate-400 uppercase tracking-widest">{e.date} | ¥{e.jpy.toLocaleString()}</p></div>
+                            <div className="flex items-center space-x-6 text-right">
+                                <p className="text-2xl font-black text-slate-800 tracking-tighter">${e.twd.toLocaleString()}</p>
+                                <button onClick={() => updateActiveTrip({...activeTrip, ledger: activeTrip.ledger.filter(l=>l.id!==e.id)})} className="text-slate-200 hover:text-red-400 transition-colors"><i className="fas fa-trash-alt"></i></button>
+                            </div>
+                        </GlassCard>
+                    ))}
+                </div>
+            </div>
+        );
+
+        if (view === 'shopping') return (
+            <div className="space-y-8 animate-in fade-in duration-300">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-4">
+                    <h1 className="text-3xl font-black text-slate-800">必買清單</h1>
+                    <GhostButton onClick={() => setIsAddModalOpen(true)} className="text-orange-500">新增想買清單</GhostButton>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    {(activeTrip.shoppingList || []).map(item => (
+                        <GlassCard key={item.id} className="p-4 bg-white flex flex-col justify-between">
+                            <div>
+                                {item.image && <img src={item.image} className="w-full h-48 object-cover rounded-2xl mb-4 border border-slate-100" alt="商品" />}
+                                <div className="flex justify-between items-start mb-2">
+                                    <h3 className="text-xl font-bold text-slate-800">{item.title}</h3>
+                                    <button onClick={() => updateActiveTrip({...activeTrip, shoppingList: activeTrip.shoppingList.filter(s=>s.id!==item.id)})} className="text-slate-200 hover:text-red-400"><i className="fas fa-trash-alt"></i></button>
+                                </div>
+                                <div className="space-y-1">
+                                    <p className="text-sm font-bold text-orange-500 flex items-center"><i className="fas fa-store mr-2 opacity-50"></i>{item.shop || '未指定店家'}</p>
+                                    <p className="text-xl font-black text-slate-700 flex items-center"><i className="fas fa-tag mr-2 opacity-50 text-sm"></i>{item.price || '尚未定價'}</p>
+                                </div>
+                            </div>
+                        </GlassCard>
+                    ))}
+                    {(!activeTrip.shoppingList?.length) && <div className="col-span-full py-20 text-center text-slate-300 font-bold italic">清單還是空的，新增一個想買的寶物吧！</div>}
+                </div>
+            </div>
+        );
+
+        if (view === 'documents') return (
+            <div className="space-y-8 animate-in fade-in duration-300">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-4"><h1 className="text-3xl font-black text-slate-800">文件憑證</h1><GhostButton onClick={() => setIsAddModalOpen(true)} className="text-blue-500">新增憑證</GhostButton></div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    {(activeTrip.documents || []).map(doc => (
+                        <GlassCard key={doc.id} className="p-5 bg-white">
+                            <div className="flex justify-between items-start mb-4"><h3 className="font-bold text-slate-800 pr-4 text-lg">{doc.title}</h3><button onClick={() => updateActiveTrip({...activeTrip, documents: activeTrip.documents.filter(d=>d.id!==doc.id)})} className="text-slate-200 hover:text-red-400 transition-colors"><i className="fas fa-trash-alt"></i></button></div>
+                            {doc.type === 'image' ? <img src={doc.content} className="w-full h-auto rounded-2xl border border-slate-100 mb-4 shadow-inner" alt="憑證" /> : <a href={doc.content} target="_blank" rel="noreferrer" className="block p-5 bg-slate-900 text-white rounded-2xl text-center font-bold text-sm hover:bg-slate-800 transition-all mb-4 shadow-xl">開啟文件連結 / PDF</a>}
+                            <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">{doc.date}</p>
+                        </GlassCard>
+                    ))}
+                </div>
+            </div>
+        );
+        
+        if (view === 'checklist') return (
+            <div className="space-y-8 animate-in fade-in duration-300">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-4"><h1 className="text-3xl font-black text-slate-800">打包清單</h1><GhostButton onClick={() => setIsAddModalOpen(true)} className="text-emerald-500">新增物品</GhostButton></div>
+                <div className="space-y-4">
+                    {(activeTrip.checklist || []).map(i => (
+                        <GlassCard key={i.id} className={`p-6 flex justify-between items-center ${i.checked ? 'bg-slate-50 opacity-60' : 'bg-white'}`} onClick={() => updateActiveTrip({...activeTrip, checklist: activeTrip.checklist.map(c=>c.id===i.id?{...c, checked:!c.checked}:c)})}>
+                            <div className="flex items-center cursor-pointer flex-1"><div className={`w-8 h-8 rounded-xl border-2 flex items-center justify-center mr-5 ${i.checked ? 'bg-orange-500 border-orange-500' : 'bg-white border-slate-200'}`}>{i.checked && <i className="fas fa-check text-white text-sm"></i>}</div><span className={`text-xl font-bold ${i.checked ? 'line-through text-slate-300' : 'text-slate-800'}`}>{i.item}</span></div>
+                            <button onClick={(e) => { e.stopPropagation(); updateActiveTrip({...activeTrip, checklist: activeTrip.checklist.filter(c=>c.id!==i.id)}); }} className="text-slate-200 hover:text-red-400"><i className="fas fa-trash-alt"></i></button>
+                        </GlassCard>
+                    ))}
+                </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="min-h-screen bg-[#F8FAFC] p-4 sm:p-8 font-sans text-slate-800 pb-40 tracking-tight">
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+            
+            <header className="max-w-5xl mx-auto flex flex-col sm:flex-row justify-between items-center mb-12 gap-8">
+                <div onClick={() => setActiveTripId(null)} className="cursor-pointer">
+                    <h1 className="text-2xl font-black italic text-slate-900 uppercase">Travel<span className="text-orange-500">Master</span></h1>
+                </div>
+                {activeTripId && (
+                    <div className="flex items-center space-x-3 bg-white p-2 rounded-2xl shadow-sm border border-slate-100">
+                        <button onClick={() => setActiveTripId(null)} className="px-5 py-2.5 bg-slate-900 text-white rounded-xl font-bold text-xs uppercase tracking-widest">返回計畫清單</button>
+                        <nav className="flex space-x-1 border-l border-slate-100 pl-3">
+                            {[{v:'home', i:'home'}, {v:'itinerary', i:'calendar-alt'}, {v:'accounting', i:'receipt'}, {v:'shopping', i:'shopping-bag'}, {v:'documents', i:'folder-open'}, {v:'checklist', i:'check-circle'}].map(btn => (
+                                <button key={btn.v} className={`w-11 h-11 rounded-xl flex items-center justify-center transition-all ${view === btn.v ? 'bg-orange-500 text-white shadow-xl shadow-orange-100' : 'text-slate-400 hover:bg-slate-50'}`} onClick={() => setView(btn.v)} title={btn.v}><i className={`fas fa-${btn.i} text-lg`}></i></button>
+                            ))}
+                        </nav>
+                    </div>
+                )}
+            </header>
+
+            <main className="max-w-5xl mx-auto">
+                {!activeTripId ? renderTripList() : renderActiveTripView()}
+            </main>
+
+            {activeTripId && (
+                <div className="fixed bottom-12 left-1/2 -translate-x-1/2 z-[100] w-full max-w-xs px-4">
+                    <PrimaryButton className="w-full py-5 text-lg flex items-center justify-center space-x-4 rounded-3xl shadow-2xl shadow-orange-200" onClick={() => setIsAddModalOpen(true)}>
+                        <i className="fas fa-plus-circle text-2xl"></i><span className="font-black uppercase tracking-widest">新增項目</span>
+                    </PrimaryButton>
+                </div>
+            )}
+
+            <CustomToast message={toast.message} type={toast.type} visible={toast.visible} />
+            
+            <AddTripModal isOpen={isAddTripModalOpen} onClose={() => setIsAddTripModalOpen(false)} onAdd={(title) => {
+                const newTrip = createNewTripTemplate(title);
+                updateAppState({ ...appState, trips: [...(appState.trips || []), newTrip] });
+                setActiveTripId(newTrip.id); setView('home'); setSelectedDateTab(newTrip.itineraries[0].date); 
+                setIsAddTripModalOpen(false); // 修正：建立完成後關閉 Modal
+                showToast('計畫已建立！');
+            }} />
+            
+            <ModalWrapper isOpen={isAddModalOpen} onClose={() => setIsAddModalOpen(false)} title={`新增${view === 'itinerary' ? '行程規劃' : view === 'accounting' ? '帳務紀錄' : view === 'shopping' ? '想買商品' : view === 'documents' ? '文件憑證' : '打包項目'}`}>
+                <AddFormContent view={view === 'home' ? 'itinerary' : view} showToast={showToast} activeTrip={activeTrip} onUpdate={updateActiveTrip} onClose={() => setIsAddModalOpen(false)} />
+            </ModalWrapper>
+            <ConfirmModal isOpen={confirmModalState.isOpen} message={confirmModalState.message} onConfirm={confirmModalState.action} onClose={() => setConfirmModalState({ ...confirmModalState, isOpen: false })} />
+        </div>
+    );
+};
+
+export default App;
